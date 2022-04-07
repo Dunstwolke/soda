@@ -5,9 +5,11 @@ pub fn main() anyerror!void {
         var editor = try LineEditor.begin();
         defer editor.end();
 
-        const string = try editor.read();
-
-        std.log.info("\r\nuser entered: '{}'", .{std.zig.fmtEscapes(string)});
+        if (try editor.read()) |string| {
+            std.log.info("\r\nuser entered: '{}'", .{std.zig.fmtEscapes(string)});
+        } else {
+            break;
+        }
     }
 }
 
@@ -67,9 +69,10 @@ pub const LineEditor = struct {
         self.length += str.len;
     }
 
-    pub fn read(self: *Self) ![]const u8 {
+    pub fn read(self: *Self) !?[]const u8 {
         var out = std.io.getStdOut();
         var in = std.io.getStdIn();
+        defer out.writeAll("\r\n") catch {};
         while (true) {
             try out.writeAll("\r");
             try out.writeAll(self.prompt);
@@ -95,7 +98,9 @@ pub const LineEditor = struct {
                     std.ascii.control_code.SOH => {},
                     std.ascii.control_code.STX => {},
                     std.ascii.control_code.ETX => {},
-                    std.ascii.control_code.EOT => {},
+                    std.ascii.control_code.EOT => if (self.length == 0) {
+                        return null;
+                    },
                     std.ascii.control_code.ENQ => {},
                     std.ascii.control_code.ACK => {},
                     std.ascii.control_code.BEL => {},
@@ -125,7 +130,7 @@ pub const LineEditor = struct {
                         iter.i += (seq.length - 1); // already consumed the ESC
 
                         switch (seq.action) {
-                            .unknown => std.log.debug("[unknown escape sequence '{s}']", .{std.fmt.fmtSliceEscapeUpper(raw_seq)}),
+                            .ignore => std.log.debug("[unknown escape sequence '{s}']", .{std.fmt.fmtSliceEscapeUpper(raw_seq)}),
                             .cursor_up => {},
                             .cursor_down => {},
                             .cursor_left => if (self.cursor > 0) {
@@ -138,6 +143,7 @@ pub const LineEditor = struct {
                                 std.mem.copy(u8, self.buffer[self.cursor..], self.buffer[self.cursor + 1 ..]);
                                 self.length -= 1;
                             },
+                            .recall_last_arg => {},
                         }
                     },
                     std.ascii.control_code.FS => {},
@@ -159,34 +165,129 @@ pub const LineEditor = struct {
     fn parseEscapeSequence(str: []const u8) EscapeSequence {
         std.debug.assert(str.len >= 1 and str[0] == std.ascii.control_code.ESC);
 
-        const payload = str[1..];
-
-        if (std.mem.startsWith(u8, payload, "[A")) {
-            return EscapeSequence{ .length = 3, .action = .cursor_up };
-        } else if (std.mem.startsWith(u8, payload, "[B")) {
-            return EscapeSequence{ .length = 3, .action = .cursor_down };
-        } else if (std.mem.startsWith(u8, payload, "[C")) {
-            return EscapeSequence{ .length = 3, .action = .cursor_right };
-        } else if (std.mem.startsWith(u8, payload, "[D")) {
-            return EscapeSequence{ .length = 3, .action = .cursor_left };
-        } else if (std.mem.startsWith(u8, payload, "[3~")) {
-            return EscapeSequence{ .length = 4, .action = .delete_right_char };
+        if (AnsiCsi.parse(str)) |csi| {
+            if (csi.final == 'A') {
+                return EscapeSequence{ .length = csi.len, .action = .{ .cursor_up = std.math.min(1, csi.arg(0, 1)) } };
+            } else if (csi.final == 'B') {
+                return EscapeSequence{ .length = csi.len, .action = .{ .cursor_down = std.math.min(1, csi.arg(0, 1)) } };
+            } else if (csi.final == 'C') {
+                return EscapeSequence{ .length = csi.len, .action = .{ .cursor_right = std.math.min(1, csi.arg(0, 1)) } };
+            } else if (csi.final == 'D') {
+                return EscapeSequence{ .length = csi.len, .action = .{ .cursor_left = std.math.min(1, csi.arg(0, 1)) } };
+            } else if (csi.final == '~') {
+                return EscapeSequence{ .length = csi.len, .action = .delete_right_char };
+            } else {
+                std.log.warn("[unknown CSI: {c}]", .{csi.final});
+                return EscapeSequence{ .length = csi.len, .action = .ignore };
+            }
+        } else if (std.mem.startsWith(u8, str, "\x1B.")) {
+            return EscapeSequence{ .length = 2, .action = .recall_last_arg };
         }
 
-        return EscapeSequence{ .length = 1, .action = .unknown };
+        return EscapeSequence{ .length = 1, .action = .ignore };
     }
+
+    // https://en.wikipedia.org/wiki/ANSI_escape_code#CSI_(Control_Sequence_Introducer)_sequences
+    const AnsiCsi = struct {
+        const ESC = std.ascii.control_code.ESC;
+        const isDigit = std.ascii.isDigit;
+
+        // For Control Sequence Introducer, or CSI, commands, the ESC [ is followed by
+        // any number (including none) of "parameter bytes" in the range 0x30–0x3F (ASCII 0–9:;<=>?),
+        // then by any number of "intermediate bytes" in the range 0x20–0x2F (ASCII space and !"#$%&'()*+,-./),
+        // then finally by a single "final byte" in the range 0x40–0x7E (ASCII @A–Z[\]^_`a–z{|}~). 
+
+        fn isParameterByte(b: u8) bool {
+            return b >= 0x30 and b <= 0x3F;
+        }
+        fn isIntermediateByte(b: u8) bool {
+            return b >= 0x20 and b <= 0x2F;
+        }
+        fn isFinalByte(b: u8) bool {
+            return b >= 0x40 and b <= 0x7E;
+        }
+
+        pub fn parse(string: []const u8) ?AnsiCsi {
+            if (string.len < 3)
+                return null;
+            if (string[0] != ESC)
+                return null;
+            if (string[1] != '[')
+                return null;
+
+            var res = AnsiCsi{
+                .final = undefined,
+                .len = undefined,
+            };
+
+            var i: usize = 2;
+
+            const parameter_start = i;
+            while (i < string.len and isParameterByte(string[i])) {
+                i += 1;
+            }
+            res.parameter = string[parameter_start..i];
+
+            const intermediate_start = i;
+            while (i < string.len and isIntermediateByte(string[i])) {
+                i += 1;
+            }
+            res.parameter = string[intermediate_start..i];
+
+            if (i >= string.len)
+                return null;
+
+            if (!isFinalByte(string[i]))
+                return null;
+
+            res.len = i + 1;
+            res.final = string[i];
+
+            // All common sequences just use the parameters as a series of
+            // semicolon-separated numbers such as 1;2;3. Missing numbers are treated
+            // as 0 (1;;3 acts like the middle number is 0, and no parameters at all in
+            // ESC[m acts like a 0 reset code).
+            // Some sequences (such as CUU) treat 0 as 1 in order to make missing
+            // parameters useful.
+            res.args = blk: {
+                var args: std.BoundedArray(usize, 8) = .{};
+                var iter = std.mem.split(u8, res.parameter, ";");
+                while (iter.next()) |param| {
+                    const value = std.fmt.parseInt(usize, param, 10) catch break :blk .{};
+                    args.append(value) catch break :blk .{};
+                }
+                break :blk args;
+            };
+
+            return res;
+        }
+
+        parameter: []const u8 = "",
+        intermediate: []const u8 = "",
+        final: u8,
+        args: std.BoundedArray(usize, 8) = .{},
+        len: usize,
+
+        pub fn arg(self: @This(), n: usize, default: usize) usize {
+            return if (self.args.len < n)
+                self.args.get(n)
+            else
+                default;
+        }
+    };
 
     const EscapeSequence = struct {
         const Action = union(enum) {
-            unknown,
-            cursor_up,
-            cursor_down,
-            cursor_left,
-            cursor_right,
+            ignore,
+            cursor_up: usize,
+            cursor_down: usize,
+            cursor_left: usize,
+            cursor_right: usize,
             delete_right_char,
+            recall_last_arg,
         };
 
         length: usize,
-        action: Action = .unknown,
+        action: Action = .ignore,
     };
 };
