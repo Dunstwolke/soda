@@ -9,42 +9,177 @@ pub fn main() anyerror!void {
     while (true) {
         const string = (try editor.read()) orelse break;
 
-        {
-            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer arena.deinit();
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
 
-            var args = std.ArrayList([]const u8).init(arena.allocator());
-            var iter = std.mem.tokenize(u8, string, "\r\n \t");
-            while (iter.next()) |str| {
-                try args.append(str);
-            }
+        const argv = try SequenceParser.parseArgvStrings(arena.allocator(), string);
+        if (argv.len == 0)
+            continue;
 
-            var child_process = try std.ChildProcess.init(args.items, arena.allocator());
-            defer child_process.deinit();
+        var child_process = try std.ChildProcess.init(argv, arena.allocator());
+        defer child_process.deinit();
 
-            const term = child_process.spawnAndWait() catch |err| {
-                std.log.err("failed to start {s}: {s}", .{
-                    args.items[0],
-                    @errorName(err),
-                });
-                continue;
-            };
-            switch (term) {
-                .Exited => |code| if (code != 0) {
-                    try stderr.writer().print("child exited: {}\n", .{code});
-                },
-                .Signal => |code| std.log.err("child received signal: {}", .{code}),
-                .Stopped => |code| std.log.err("child was stopped: {}", .{code}),
-                .Unknown => |code| std.log.err("child exited due to unknown reason: {}", .{code}),
-            }
+        const term = child_process.spawnAndWait() catch |err| {
+            std.log.err("failed to start {s}: {s}", .{
+                argv[0],
+                @errorName(err),
+            });
+            continue;
+        };
+        switch (term) {
+            .Exited => |code| if (code != 0) {
+                try stderr.writer().print("child exited: {}\n", .{code});
+            },
+            .Signal => |code| try stderr.writer().print("child received signal: {}\n", .{code}),
+            .Stopped => |code| try stderr.writer().print("child was stopped: {}\n", .{code}),
+            .Unknown => |code| try stderr.writer().print("child exited due to unknown reason: {}\n", .{code}),
         }
     }
 }
 
-test "basic test" {
-    try std.testing.expectEqual(10, 3 + 7);
+/// Parses a typed out command sequence into smaller parts
+pub const SequenceParser = struct {
+    const ptk = @import("ptk");
+
+    const whitespace = " \t\r\n";
+
+    const TokenType = enum {
+        word, // words that are not separated by whitespace
+        whitespace, // any non-visible characters
+        single_quoted_string, // 'foo bar'
+        double_quoted_string, // "foo bar"
+    };
+
+    const Pattern = ptk.Pattern(TokenType);
+
+    const Tokenizer = ptk.Tokenizer(TokenType, &.{
+        Pattern.create(.double_quoted_string, matchDoubleQuotedString),
+        Pattern.create(.single_quoted_string, matchSingleQuotedString),
+        Pattern.create(.word, ptk.matchers.takeNoneOf(whitespace)),
+        Pattern.create(.whitespace, ptk.matchers.takeAnyOf(whitespace)),
+    });
+
+    fn matchSingleQuotedString(str: []const u8) ?usize {
+        if (str.len < 2)
+            return null;
+        if (str[0] != '\'')
+            return null;
+        var i: usize = 1;
+        while (i < str.len) : (i += 1) {
+            if (str[i] == '\'')
+                return i + 1;
+        }
+        return null;
+    }
+
+    fn matchDoubleQuotedString(str: []const u8) ?usize {
+        if (str.len < 2)
+            return null;
+        if (str[0] != '\"')
+            return null;
+        var i: usize = 1;
+        while (i < str.len) : (i += 1) {
+            if (str[i] == '\\') {
+                i += 1;
+            } else if (str[i] == '\"') {
+                return i + 1;
+            }
+        }
+        return null;
+    }
+
+    fn parseArgvStrings(allocator: std.mem.Allocator, string: []const u8) ![][]u8 {
+        var argv = std.ArrayList([]u8).init(allocator);
+        defer {
+            for (argv.items) |str| {
+                allocator.free(str);
+            }
+            argv.deinit();
+        }
+
+        var tokenizer = Tokenizer.init(string, null);
+
+        var current = std.ArrayList(u8).init(allocator);
+        defer current.deinit();
+
+        while (try tokenizer.next()) |token| {
+            switch (token.type) {
+                .word => try current.appendSlice(token.text),
+                .whitespace => if (current.items.len > 0) {
+                    const str = current.toOwnedSlice();
+                    errdefer allocator.free(str);
+                    try argv.append(str);
+                },
+                .single_quoted_string => try current.appendSlice(token.text[1 .. token.text.len - 1]),
+                .double_quoted_string => {
+                    const seq = token.text[1 .. token.text.len - 1];
+                    try translatedStringEscapeSequences(current.writer(), seq);
+                },
+            }
+        }
+
+        if (current.items.len > 0) {
+            const str = current.toOwnedSlice();
+            errdefer allocator.free(str);
+            try argv.append(str);
+        }
+
+        return argv.toOwnedSlice();
+    }
+
+    fn translatedStringEscapeSequences(writer: anytype, string: []const u8) !void {
+        var i: usize = 0;
+        while (i < string.len) {
+            switch (string[i]) {
+                '\\' => {
+                    std.debug.assert(i + 1 < string.len);
+                    const escaped = string[i + 1];
+                    switch (escaped) {
+                        // 'u' => {},
+                        // 'U' => {},
+                        else => try writer.writeByte(escaped),
+                    }
+                    i += 2;
+                },
+                else => {
+                    try writer.writeByte(string[i]);
+                    i += 1;
+                },
+            }
+        }
+    }
+};
+
+fn testArgvParsing(input: []const u8, expected: []const []const u8) !void {
+    var argv = try SequenceParser.parseArgvStrings(std.testing.allocator, input);
+    defer {
+        for (argv) |item| {
+            std.testing.allocator.free(item);
+        }
+        std.testing.allocator.free(argv);
+    }
+    try std.testing.expectEqual(expected.len, argv.len);
+    for (argv) |item, i| {
+        try std.testing.expectEqualStrings(expected[i], item);
+    }
 }
 
+test "basic sequence argv parsing" {
+    try testArgvParsing("", &.{});
+    try testArgvParsing("hello", &.{"hello"});
+    try testArgvParsing("hello world!", &.{ "hello", "world!" });
+    try testArgvParsing("hello   world!", &.{ "hello", "world!" });
+    try testArgvParsing("    hello   world!", &.{ "hello", "world!" });
+    try testArgvParsing("    hello   world     !", &.{ "hello", "world", "!" });
+    try testArgvParsing("hello world     !", &.{ "hello", "world", "!" });
+    try testArgvParsing(" \t\thello\tworld\t", &.{ "hello", "world" });
+    try testArgvParsing("'hello' 'world!'", &.{ "hello", "world!" });
+    try testArgvParsing("'hello world!'", &.{"hello world!"});
+    try testArgvParsing("'hello world!' hello world", &.{ "hello world!", "hello", "world" });
+    try testArgvParsing("'hello''wo rld'", &.{"hellowo rld"});
+}
+
+/// Terminal line input
 pub const LineEditor = struct {
     const Self = @This();
 
