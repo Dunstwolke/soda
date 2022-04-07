@@ -1,14 +1,42 @@
 const std = @import("std");
 
 pub fn main() anyerror!void {
-    while (true) {
-        var editor = try LineEditor.begin();
-        defer editor.end();
+    var editor = try LineEditor.init();
+    defer editor.deinit();
 
-        if (try editor.read()) |string| {
-            std.log.info("\r\nuser entered: '{}'", .{std.zig.fmtEscapes(string)});
-        } else {
-            break;
+    var stderr = std.io.getStdErr();
+
+    while (true) {
+        const string = (try editor.read()) orelse break;
+
+        {
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+
+            var args = std.ArrayList([]const u8).init(arena.allocator());
+            var iter = std.mem.tokenize(u8, string, "\r\n \t");
+            while (iter.next()) |str| {
+                try args.append(str);
+            }
+
+            var child_process = try std.ChildProcess.init(args.items, arena.allocator());
+            defer child_process.deinit();
+
+            const term = child_process.spawnAndWait() catch |err| {
+                std.log.err("failed to start {s}: {s}", .{
+                    args.items[0],
+                    @errorName(err),
+                });
+                continue;
+            };
+            switch (term) {
+                .Exited => |code| if (code != 0) {
+                    try stderr.writer().print("child exited: {}\n", .{code});
+                },
+                .Signal => |code| std.log.err("child received signal: {}", .{code}),
+                .Stopped => |code| std.log.err("child was stopped: {}", .{code}),
+                .Unknown => |code| std.log.err("child exited due to unknown reason: {}", .{code}),
+            }
         }
     }
 }
@@ -28,7 +56,7 @@ pub const LineEditor = struct {
 
     saved_attribs: std.os.linux.termios = undefined,
 
-    pub fn begin() !Self {
+    pub fn init() !Self {
         var self = Self{
             .saved_attribs = try std.os.tcgetattr(std.os.STDIN_FILENO),
             .cursor = 0,
@@ -36,22 +64,10 @@ pub const LineEditor = struct {
         };
         errdefer std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, self.saved_attribs) catch |err| std.log.err("failed to reset tca attributes: {s}", .{@errorName(err)});
 
-        var attribs = self.saved_attribs;
-
-        const linux = std.os.linux;
-
-        attribs.iflag &= ~@as(std.os.linux.tcflag_t, linux.BRKINT | linux.IGNBRK | linux.PARMRK | linux.ISTRIP | linux.INLCR | linux.IGNCR | linux.ICRNL | linux.IXON);
-        attribs.oflag &= ~@as(std.os.linux.tcflag_t, linux.OPOST);
-        attribs.lflag &= ~@as(std.os.linux.tcflag_t, linux.ECHO | linux.ECHONL | linux.ICANON | linux.IEXTEN);
-        attribs.cflag &= ~@as(std.os.linux.tcflag_t, linux.CSIZE | linux.PARENB);
-
-        try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, attribs);
-
         return self;
     }
 
-    pub fn end(self: *Self) void {
-        std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, self.saved_attribs) catch |err| std.log.err("failed to reset tca attributes: {s}", .{@errorName(err)});
+    pub fn deinit(self: *Self) void {
         self.* = undefined;
     }
 
@@ -72,7 +88,26 @@ pub const LineEditor = struct {
     pub fn read(self: *Self) !?[]const u8 {
         var out = std.io.getStdOut();
         var in = std.io.getStdIn();
+
         defer out.writeAll("\r\n") catch {};
+        defer std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, self.saved_attribs) catch |err| std.log.err("failed to reset tca attributes: {s}", .{@errorName(err)});
+
+        {
+            var attribs = self.saved_attribs;
+
+            const linux = std.os.linux;
+
+            attribs.iflag &= ~@as(std.os.linux.tcflag_t, linux.BRKINT | linux.IGNBRK | linux.PARMRK | linux.ISTRIP | linux.INLCR | linux.IGNCR | linux.ICRNL | linux.IXON);
+            attribs.oflag &= ~@as(std.os.linux.tcflag_t, linux.OPOST);
+            attribs.lflag &= ~@as(std.os.linux.tcflag_t, linux.ECHO | linux.ECHONL | linux.ICANON | linux.IEXTEN);
+            attribs.cflag &= ~@as(std.os.linux.tcflag_t, linux.CSIZE | linux.PARENB);
+
+            try std.os.tcsetattr(std.os.STDIN_FILENO, std.os.TCSA.NOW, attribs);
+        }
+
+        self.length = 0;
+        self.cursor = 0;
+
         while (true) {
             try out.writeAll("\r");
             try out.writeAll(self.prompt);
@@ -143,6 +178,8 @@ pub const LineEditor = struct {
                                 std.mem.copy(u8, self.buffer[self.cursor..], self.buffer[self.cursor + 1 ..]);
                                 self.length -= 1;
                             },
+                            .cursor_home => self.cursor = 0,
+                            .cursor_end => self.cursor = self.length,
                             .recall_last_arg => {},
                         }
                     },
@@ -174,6 +211,10 @@ pub const LineEditor = struct {
                 return EscapeSequence{ .length = csi.len, .action = .{ .cursor_right = std.math.min(1, csi.arg(0, 1)) } };
             } else if (csi.final == 'D') {
                 return EscapeSequence{ .length = csi.len, .action = .{ .cursor_left = std.math.min(1, csi.arg(0, 1)) } };
+            } else if (csi.final == 'H') {
+                return EscapeSequence{ .length = csi.len, .action = .cursor_home };
+            } else if (csi.final == 'F') {
+                return EscapeSequence{ .length = csi.len, .action = .cursor_end };
             } else if (csi.final == '~') {
                 return EscapeSequence{ .length = csi.len, .action = .delete_right_char };
             } else {
@@ -283,6 +324,8 @@ pub const LineEditor = struct {
             cursor_down: usize,
             cursor_left: usize,
             cursor_right: usize,
+            cursor_home,
+            cursor_end,
             delete_right_char,
             recall_last_arg,
         };

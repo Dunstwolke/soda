@@ -7,3 +7,6 @@ echo 'hi'
 
 echo hi | cat
 
+var x = 10
+
+$x = 20
